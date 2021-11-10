@@ -47,7 +47,6 @@ import io.activej.promise.Promises;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.List;
-import java.util.Map;
 import java.util.stream.Collectors;
 
 import static io.activej.common.Checks.checkArgument;
@@ -55,6 +54,7 @@ import static java.util.stream.Collectors.toList;
 
 @SuppressWarnings("rawtypes") // JMX
 public final class CrdtStorageCluster<K extends Comparable<K>, S, P extends Comparable<P>> implements CrdtStorage<K, S>, WithInitializer<CrdtStorageCluster<K, S, P>>, EventloopService, EventloopJmxBeanWithStats {
+	private final Eventloop eventloop;
 	private final CrdtPartitions<K, S, P> partitions;
 
 	private final CrdtFunction<S> function;
@@ -84,21 +84,22 @@ public final class CrdtStorageCluster<K extends Comparable<K>, S, P extends Comp
 	// endregion
 
 	// region creators
-	private CrdtStorageCluster(CrdtPartitions<K, S, P> partitions, CrdtFunction<S> function) {
+	private CrdtStorageCluster(Eventloop eventloop, CrdtPartitions<K, S, P> partitions, CrdtFunction<S> function) {
+		this.eventloop = eventloop;
 		this.partitions = partitions;
 		this.function = function;
 	}
 
 	public static <K extends Comparable<K>, S, P extends Comparable<P>> CrdtStorageCluster<K, S, P> create(
-			CrdtPartitions<K, S, P> partitions, CrdtFunction<S> crdtFunction
+			Eventloop eventloop, CrdtPartitions<K, S, P> partitions, CrdtFunction<S> crdtFunction
 	) {
-		return new CrdtStorageCluster<>(partitions, crdtFunction);
+		return new CrdtStorageCluster<>(eventloop, partitions, crdtFunction);
 	}
 
 	public static <K extends Comparable<K>, S extends CrdtType<S>, P extends Comparable<P>> CrdtStorageCluster<K, S, P> create(
-			CrdtPartitions<K, S, P> partitions
+			Eventloop eventloop, CrdtPartitions<K, S, P> partitions
 	) {
-		return new CrdtStorageCluster<>(partitions, CrdtFunction.ofCrdtType());
+		return new CrdtStorageCluster<>(eventloop, partitions, CrdtFunction.ofCrdtType());
 	}
 
 	public CrdtStorageCluster<K, S, P> withReplicationCount(int replicationCount) {
@@ -134,7 +135,7 @@ public final class CrdtStorageCluster<K extends Comparable<K>, S, P extends Comp
 
 	@Override
 	public @NotNull Eventloop getEventloop() {
-		return partitions.getEventloop();
+		return eventloop;
 	}
 
 	public CrdtPartitions<K, S, P> getPartitions() {
@@ -143,13 +144,11 @@ public final class CrdtStorageCluster<K extends Comparable<K>, S, P extends Comp
 
 	private <T extends AsyncCloseable> Promise<List<Container<T>>> connect(AsyncFunction<CrdtStorage<K, S>, T> method) {
 		return Promises.toList(
-						partitions.getAlivePartitions().entrySet().stream()
+						partitions.getPartitions().entrySet().stream()
 								.map(entry ->
 										method.apply(entry.getValue())
 												.map(t -> new Container<>(entry.getKey(), t))
-												.whenException(err -> partitions.markDead(entry.getKey(), err))
 												.toTry()))
-				.map(this::checkStillNotDead)
 				.map(tries -> {
 					List<Container<T>> successes = tries.stream()
 							.filter(Try::isSuccess)
@@ -173,7 +172,7 @@ public final class CrdtStorageCluster<K extends Comparable<K>, S, P extends Comp
 									acceptors[index].accept(item);
 								}
 							});
-					RefInt failedRef = tolerantSplit(containers, sharder, splitter);
+					RefInt failedRef = tolerantSplit(containers, splitter);
 					return Promise.of(splitter.getInput()
 							.transformWith(detailedStats ? uploadStatsDetailed : uploadStats)
 							.withAcknowledgement(ack -> ack
@@ -215,7 +214,7 @@ public final class CrdtStorageCluster<K extends Comparable<K>, S, P extends Comp
 							acceptors[index].accept(item);
 						}
 					});
-					RefInt failedRef = tolerantSplit(containers, sharderAll, splitter);
+					RefInt failedRef = tolerantSplit(containers, splitter);
 					return splitter.getInput()
 							.transformWith(detailedStats ? removeStatsDetailed : removeStats)
 							.withAcknowledgement(ack -> ack
@@ -243,24 +242,8 @@ public final class CrdtStorageCluster<K extends Comparable<K>, S, P extends Comp
 		return Promise.complete();
 	}
 
-	private <T extends AsyncCloseable> List<Try<Container<T>>> checkStillNotDead(List<Try<Container<T>>> value) throws CrdtException {
-		Map<P, CrdtStorage<K, S>> deadPartitions = partitions.getDeadPartitions();
-		if (deadPartitions.size() > deadPartitionsThreshold) {
-			CrdtException exception = new CrdtException("There are more dead partitions than allowed(" +
-					deadPartitions.size() + " dead, threshold is " + deadPartitionsThreshold + "), aborting");
-			//noinspection ConstantConditions - a Try is successful
-			value.stream()
-					.filter(Try::isSuccess)
-					.map(Try::get)
-					.forEach(container -> container.value.closeEx(exception));
-			throw exception;
-		}
-		return value;
-	}
-
 	private <T> RefInt tolerantSplit(
 			List<Container<StreamConsumer<T>>> containers,
-			RendezvousHashSharder<P> sharder,
 			StreamSplitter<T, T> splitter
 	) {
 		RefInt failed = new RefInt(0);
@@ -268,8 +251,6 @@ public final class CrdtStorageCluster<K extends Comparable<K>, S, P extends Comp
 			StreamSupplier<T> supplier = splitter.addOutput(splitter.new Output() {
 				@Override
 				protected void onError(Exception e) {
-					partitions.markDead(container.id, e);
-					sharder.recompute(partitions.getAlivePartitions().keySet());
 					if (++failed.value == containers.size()) {
 						splitter.getInput().closeEx(e);
 					} else {
@@ -313,7 +294,6 @@ public final class CrdtStorageCluster<K extends Comparable<K>, S, P extends Comp
 								advance();
 							}
 							closeInput();
-							partitions.markDead(container.id, e);
 							if (++failed.value == containers.size()) {
 								super.onError(e);
 							} else {

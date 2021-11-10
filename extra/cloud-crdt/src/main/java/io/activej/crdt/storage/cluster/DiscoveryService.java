@@ -17,25 +17,25 @@
 package io.activej.crdt.storage.cluster;
 
 import io.activej.async.callback.Callback;
-import io.activej.crdt.storage.CrdtStorage;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.Objects;
 
 public interface DiscoveryService<K extends Comparable<K>, S, P extends Comparable<P>> {
 
 	void discover(
-			@Nullable Map<P, ? extends CrdtStorage<K, S>> previous,
-			Callback<Map<P, ? extends CrdtStorage<K, S>>> cb
+			@Nullable PartitionScheme<K, S, P> previous,
+			Callback<PartitionScheme<K, S, P>> cb
 	);
 
-	static <K extends Comparable<K>, S, P extends Comparable<P>> DiscoveryService<K, S, P> constant(Map<P, ? extends CrdtStorage<K, S>> partitions) {
-		Map<P, ? extends CrdtStorage<K, S>> constant = Collections.unmodifiableMap(new HashMap<>(partitions));
+	static <K extends Comparable<K>, S, P extends Comparable<P>> DiscoveryService<K, S, P> constant(@NotNull PartitionScheme<K, S, P> partitionScheme) {
 		return (previous, cb) -> {
-			if (!constant.equals(previous)) {
-				cb.accept(constant, null);
+			if (previous == null ||
+					!Objects.equals(previous.getCurrentPartitions(), partitionScheme.getCurrentPartitions()) ||
+					!Objects.equals(previous.getTargetPartitions(), partitionScheme.getTargetPartitions())
+			) {
+				cb.accept(partitionScheme, null);
 			}
 		};
 	}
